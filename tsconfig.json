@@ -1,0 +1,12 @@
+{
+    "extends": "@tsconfig/node18/tsconfig.json",
+    "outDir": "./dist",
+    "compilerOptions": {
+        "declaration": true,
+        "sourceMap": true,
+        "outDir": "./dist",
+        "noImplicitAny": true,
+        "strict": true
+      },
+      "exclude": ["dist", "test/**/*","lib"]
+}
