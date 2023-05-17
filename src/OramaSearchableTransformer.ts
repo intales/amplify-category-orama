@@ -2,18 +2,37 @@ import { DirectiveWrapper, InvalidDirectiveError, TransformerPluginBase } from '
 import {
 	TransformerContextProvider,
 	TransformerSchemaVisitStepContextProvider,
+	TransformerTransformSchemaStepContextProvider,
 } from '@aws-amplify/graphql-transformer-interfaces';
 import { CfnCondition, CfnParameter, Fn } from 'aws-cdk-lib';
-import { DynamoDbDataSource } from 'aws-cdk-lib/aws-appsync';
+import { CfnResolver, DynamoDbDataSource } from 'aws-cdk-lib/aws-appsync';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { IConstruct } from 'constructs';
 import { DirectiveNode, ObjectTypeDefinitionNode } from 'graphql';
-import { ModelResourceIDs, ResourceConstants, graphqlName, plurality, toUpper } from 'graphql-transformer-common';
-import { createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
+import {
+	ModelResourceIDs,
+	ResourceConstants,
+	graphqlName,
+	makeField,
+	makeInputValueDefinition,
+	makeListType,
+	makeNamedType,
+	makeNonNullType,
+	plurality,
+	toUpper,
+} from 'graphql-transformer-common';
+import { createEventSourceMapping, createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
 import { DirectiveArgs } from './directive-args';
 
 const STACK_NAME = 'OramaStack';
 const directiveName = 'oramaSearchable';
+const RESPONSE_MAPPING_TEMPLATE = `
+#if( $ctx.error )
+  $util.error($ctx.error.message, $ctx.error.type)
+#else
+  $util.parseJson($ctx.result)
+#end
+`;
 
 interface SearchableObjectTypeDefinition {
 	node: ObjectTypeDefinitionNode;
@@ -26,25 +45,26 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 	searchableObjectTypeDefinitions: SearchableObjectTypeDefinition[];
 
 	constructor() {
-		super(
-			'OramaSearchableTransformer',
-			/* GraphQL */ `
-      directive @${directiveName} on OBJECT
-    `
-		);
+		super('OramaSearchableTransformer', `directive @${directiveName} on OBJECT`);
 		this.searchableObjectTypeDefinitions = [];
 	}
 
+	/**
+	 * generate resolvers
+	 */
 	generateResolvers(context: TransformerContextProvider) {
 		const { Env } = ResourceConstants.PARAMETERS;
 		const { HasEnvironmentParameter } = ResourceConstants.CONDITIONS;
 		const stack = context.stackManager.createStack(STACK_NAME);
 
 		const envParam = context.stackManager.getParameter(Env) as CfnParameter;
-		// eslint-disable-next-line no-new
+
 		new CfnCondition(stack, HasEnvironmentParameter, {
 			expression: Fn.conditionNot(Fn.conditionEquals(envParam, ResourceConstants.NONE)),
 		});
+
+		stack.templateOptions.description = 'An auto-generated nested stack for orama search.';
+		stack.templateOptions.templateFormatVersion = '2010-09-09';
 
 		// streaming lambda role
 		const lambdaRole = createLambdaRole(context, stack);
@@ -52,9 +72,10 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 		// creates algolia lambda
 		const lambda = createLambda(stack, context.api, lambdaRole, Env);
 
+		// add lambda as data source for the search queries
+		const lambdaDataSource = context.api.host.addLambdaDataSource(`searchResolverDataSource`, lambda, {}, stack);
+
 		for (const definition of this.searchableObjectTypeDefinitions) {
-			//const type = definition.node.name.value;
-			const fields = definition.node.fields?.map((f) => f.name.value) ?? [];
 			const typeName = context.output.getQueryTypeName();
 			const table = getTable(context, definition.node);
 			const ddbTable = table as Table;
@@ -62,19 +83,44 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 			if (!ddbTable) {
 				throw new Error(`Failed to find ddb table for @${directiveName} on field ${definition.fieldNameRaw}`);
 			}
+
+			ddbTable.grantStreamRead(lambdaRole);
+
 			// creates event source mapping from ddb to lambda
 			if (!ddbTable.tableStreamArn) {
 				throw new Error('tableStreamArn is required on ddb table ot create event source mappings');
 			}
 
-			ddbTable.grantStreamRead(lambdaRole);
+			createEventSourceMapping(
+				stack,
+				`eventSourceMapping-${definition.fieldNameRaw}-${Env}`,
+				lambda,
+				ddbTable.tableStreamArn
+			);
 
 			if (!typeName) {
 				throw new Error('Query type name not found');
 			}
+			// Connect the resolver to the API
+			const resolver = new CfnResolver(stack, `${definition.fieldNameRaw}SearchResolver`, {
+				apiId: context.api.apiId,
+				fieldName: definition.fieldName,
+				typeName: 'Query',
+				// kind: 'UNIT',
+				dataSourceName: lambdaDataSource.ds.attrName,
+				requestMappingTemplate: getRequestMappingTemplate(ddbTable.tableName),
+				responseMappingTemplate: RESPONSE_MAPPING_TEMPLATE,
+			});
+
+			context.api.addSchemaDependency(resolver);
 		}
 	}
 
+	/**
+	 * A transformer implements a single function per location that its directive can be applied.
+	 * This method handles transforming directives on objects type definitions. This includes type
+	 * extensions.
+	 */
 	object(
 		definition: ObjectTypeDefinitionNode,
 		directive: DirectiveNode,
@@ -91,12 +137,42 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 			directiveArguments,
 		});
 	}
+
+	/**
+	 * Update the schema with additional queries and input types
+	 */
+	transformSchema(context: TransformerTransformSchemaStepContextProvider) {
+		// For each model that has been annotated with @oramaSearchable
+		const fields = this.searchableObjectTypeDefinitions.map(({ fieldName, fieldNameRaw }) => {
+			// Add the search query field to the schema
+			// e.g. searchBlogs(query: String): AWSJSON
+
+			const field = {
+				name: fieldName,
+				args: [
+					/* term */
+					makeInputValueDefinition('term', makeNamedType('String')),
+					/* limit */
+					makeInputValueDefinition('limit', makeNamedType('Int')),
+				],
+				type: makeNonNullType(makeListType(makeNamedType(fieldNameRaw))),
+			};
+			return makeField(field.name, field.args, field.type);
+		});
+		context.output.addQueryFields(fields);
+	}
 }
 
 const validateModelDirective = (definition: ObjectTypeDefinitionNode): void => {
-	const modelDirective = definition?.directives?.find((dir) => dir.name.value === 'model');
-	if (!modelDirective) {
+	const values = definition.directives?.map(({ name }) => name.value);
+	if (values === undefined || !values.includes('model')) {
 		throw new InvalidDirectiveError(`Types annotated with @${directiveName} must also be annotated with @model.`);
+	}
+
+	const modelIndex = values.indexOf('model');
+	const oramaSearchableIndex = values.indexOf(directiveName);
+	if (modelIndex + 1 !== oramaSearchableIndex) {
+		throw new InvalidDirectiveError(`@${directiveName} must be positionated next to @model`);
 	}
 };
 
@@ -116,3 +192,7 @@ const getTable = (context: TransformerContextProvider, definition: ObjectTypeDef
 	const table = ddbDataSource.ds.stack.node.findChild(tableName);
 	return table;
 };
+
+const getRequestMappingTemplate = (tableName: string) => /* VTL */ `
+$util.toJson({ "version": "2018-05-29", "operation": "Invoke", "payload": $util.toJson({ "typeName": "Query", "tableName": "${tableName}", "arguments": $util.toJson($ctx.args) }) })
+`;
