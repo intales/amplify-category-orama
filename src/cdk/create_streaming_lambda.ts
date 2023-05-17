@@ -1,7 +1,7 @@
 import { GraphQLAPIProvider, TransformerContextProvider } from '@aws-amplify/graphql-transformer-interfaces';
 import { Stack } from 'aws-cdk-lib';
 import { Effect, IRole, Policy, PolicyStatement, Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
-import { IFunction, ILayerVersion, Runtime } from 'aws-cdk-lib/aws-lambda';
+import { EventSourceMapping, IFunction, ILayerVersion, Runtime, StartingPosition } from 'aws-cdk-lib/aws-lambda';
 import { Construct } from 'constructs';
 import { resolve } from 'path';
 
@@ -58,4 +58,13 @@ export const createLambda = (
 		timeout,
 		stack
 	);
+};
+
+export const createEventSourceMapping = (stack: Construct, type: string, target: IFunction, tableStreamArn: string) => {
+	return new EventSourceMapping(stack, type, {
+		eventSourceArn: tableStreamArn,
+		target,
+		enabled: true,
+		startingPosition: StartingPosition.LATEST,
+	});
 };
