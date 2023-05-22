@@ -9,6 +9,8 @@
     "@typescript-eslint"
   ],
   "rules": {
+    "camelcase": "error",
+    "array-callback-return":"error",
     "eqeqeq": "error",
     "no-console": "warn",
     "no-undef": "warn",
