@@ -1,14 +1,16 @@
 import { DirectiveWrapper, InvalidDirectiveError, TransformerPluginBase } from '@aws-amplify/graphql-transformer-core';
 import {
 	TransformerContextProvider,
+	TransformerPluginProvider,
 	TransformerSchemaVisitStepContextProvider,
 	TransformerTransformSchemaStepContextProvider,
 } from '@aws-amplify/graphql-transformer-interfaces';
+import { Schema, SearchableType } from '@orama/orama';
 import { CfnCondition, CfnParameter, Fn } from 'aws-cdk-lib';
 import { CfnResolver, DynamoDbDataSource } from 'aws-cdk-lib/aws-appsync';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { IConstruct } from 'constructs';
-import { DirectiveNode, ObjectTypeDefinitionNode } from 'graphql';
+import { DirectiveNode, EnumTypeDefinitionNode, ObjectTypeDefinitionNode, TypeNode } from 'graphql';
 import {
 	ModelResourceIDs,
 	ResourceConstants,
@@ -22,7 +24,7 @@ import {
 	toUpper,
 } from 'graphql-transformer-common';
 import { createEventSourceMapping, createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
-import { DirectiveArgs } from './directive-args';
+import { DirectiveArgs, GRAPHQL_TYPES_TO_VALID_TYPES, VALID_SCHEMA_TYPES } from './directive-args';
 
 const STACK_NAME = 'OramaStack';
 const directiveName = 'oramaSearchable';
@@ -41,11 +43,16 @@ interface SearchableObjectTypeDefinition {
 	directiveArguments: DirectiveArgs;
 }
 
-export class OramaSearchableTransformer extends TransformerPluginBase {
+export class OramaSearchableTransformer extends TransformerPluginBase implements TransformerPluginProvider {
 	searchableObjectTypeDefinitions: SearchableObjectTypeDefinition[];
 
 	constructor() {
-		super('OramaSearchableTransformer', `directive @${directiveName} on OBJECT`);
+		super(
+			'OramaSearchableTransformer',
+			`
+		directive @${directiveName}(schema: AWSJSON) on OBJECT
+		`
+		);
 		this.searchableObjectTypeDefinitions = [];
 	}
 
@@ -125,10 +132,11 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 		definition: ObjectTypeDefinitionNode,
 		directive: DirectiveNode,
 		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		_ctx: TransformerSchemaVisitStepContextProvider
+		acc: TransformerSchemaVisitStepContextProvider
 	) {
 		validateModelDirective(definition);
 		const directiveArguments = getDirectiveArguments(directive);
+		validateSchemaFields(directiveArguments.schema, definition);
 		const fieldName = graphqlName(`search${plurality(toUpper(definition.name.value), true)}`);
 		this.searchableObjectTypeDefinitions.push({
 			node: definition,
@@ -161,7 +169,116 @@ export class OramaSearchableTransformer extends TransformerPluginBase {
 		});
 		context.output.addQueryFields(fields);
 	}
+
+	/**
+	 *  Validate the schema after individual transformers finishes parsing the AST
+	 */
+	validate(context: TransformerSchemaVisitStepContextProvider) {
+		const { inputDocument } = context;
+		const customObjectTypes = inputDocument.definitions.filter(
+			({ kind }) => kind === 'ObjectTypeDefinition'
+		) as ObjectTypeDefinitionNode[];
+
+		const customEnumTypes = inputDocument.definitions.filter(
+			({ kind }) => kind === 'EnumTypeDefinition'
+		) as EnumTypeDefinitionNode[];
+
+		const visitedTypes = new Map<string, Record<string, string> | string[]>();
+
+		for (const { directiveArguments } of this.searchableObjectTypeDefinitions) {
+			const notFoundSchemaTypes = getNonValidSchemaType(directiveArguments);
+
+			while (notFoundSchemaTypes.length > 0) {
+				const notFoundType = notFoundSchemaTypes.shift();
+				if (notFoundType === undefined) {
+					throw new Error('notFoundType is undefined');
+				}
+				if (visitedTypes.has(notFoundType)) {
+					throw new InvalidDirectiveError(`Circular reference detected for type ${notFoundType}`);
+				}
+				const correctObject = customObjectTypes.find(({ name }) => name.value === notFoundType);
+
+				if (correctObject !== undefined) {
+					// found
+					const fields = [];
+					const tmp: Record<string, string> = {};
+					for (const field of correctObject.fields ?? []) {
+						const { type, validType } = getCorrectType(field.type);
+						if (validType === undefined) fields.push(type);
+						tmp[field.name.value] = validType ?? type;
+					}
+					visitedTypes.set(notFoundType, tmp);
+					notFoundSchemaTypes.push(...fields);
+				} else {
+					// not found on objects, search into enums
+					const correctEnum = customEnumTypes.find(({ name }) => name.value === notFoundType);
+					if (correctEnum === undefined) {
+						throw new InvalidDirectiveError(`${notFoundType} not found in schema`);
+					} else {
+						visitedTypes.set(notFoundType, correctEnum.values?.map(({ name }) => name.value) ?? []);
+					}
+				}
+			}
+			// now that all types are found, complete the schema
+			const schema: Schema = {};
+			for (const [schemaField, schemaType] of Object.entries(directiveArguments.schema)) {
+				schema[schemaField] = getSchema(schemaType, visitedTypes);
+			}
+			// schema is ready
+		}
+	}
 }
+
+const getSchema = (
+	schemaType: string,
+	visitedTypes: Map<string, Record<string, string> | string[]>
+): SearchableType | Schema => {
+	if (VALID_SCHEMA_TYPES.includes(schemaType)) {
+		return schemaType as SearchableType;
+	}
+	const value = visitedTypes.get(schemaType);
+
+	if (value === undefined) {
+		throw new InvalidDirectiveError(`The schema type ${schemaType} is not supported`);
+	}
+
+	if (Array.isArray(value)) {
+		// handling enum
+		return 'string';
+	}
+
+	// it is an object
+	const schema: Schema = {};
+	for (const [field, type] of Object.entries(value)) {
+		schema[field] = getSchema(type, visitedTypes);
+	}
+	return schema;
+};
+
+const getNonValidSchemaType = ({ schema }: DirectiveArgs) => {
+	return Object.values(schema)
+		.map((schemaValue) => {
+			const type = typeof schemaValue;
+			switch (type) {
+				case 'string':
+					return schemaValue;
+				case 'object':
+					return type;
+				default:
+					throw new InvalidDirectiveError(`The schema type ${type} is not supported`);
+			}
+		})
+		.filter((value) => !VALID_SCHEMA_TYPES.includes(value));
+};
+
+const getValidSchemaType = (type: string) => GRAPHQL_TYPES_TO_VALID_TYPES[type];
+
+const getCorrectType = (node: TypeNode, fn = getValidSchemaType): { validType: string | undefined; type: string } => {
+	while (node.kind !== 'NamedType') node = node.type;
+
+	const type = node.name.value;
+	return { validType: fn(type), type };
+};
 
 const validateModelDirective = (definition: ObjectTypeDefinitionNode): void => {
 	const values = definition.directives?.map(({ name }) => name.value);
@@ -177,10 +294,9 @@ const validateModelDirective = (definition: ObjectTypeDefinitionNode): void => {
 };
 
 const getDirectiveArguments = (directive: DirectiveNode): DirectiveArgs => {
-	const directiveWrapped = new DirectiveWrapper(directive as ConstructorParameters<typeof DirectiveWrapper>[0]);
+	const directiveWrapped = new DirectiveWrapper(directive);
 	const directiveArguments: DirectiveArgs = directiveWrapped.getArguments({
-		fields: undefined,
-		settings: undefined,
+		schema: {},
 	});
 	return directiveArguments;
 };
@@ -196,3 +312,9 @@ const getTable = (context: TransformerContextProvider, definition: ObjectTypeDef
 const getRequestMappingTemplate = (tableName: string) => /* VTL */ `
 $util.toJson({ "version": "2018-05-29", "operation": "Invoke", "payload": $util.toJson({ "typeName": "Query", "tableName": "${tableName}", "arguments": $util.toJson($ctx.args) }) })
 `;
+function validateSchemaFields(schema: Record<string, string>, definition: ObjectTypeDefinitionNode) {
+	Object.keys(schema).forEach((key) => {
+		if (!definition.fields?.map((el) => el.name.value).includes(key))
+			throw new InvalidDirectiveError(`${key} is not a valid field of ${definition.name.value}`);
+	});
+}
