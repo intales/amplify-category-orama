@@ -10,6 +10,7 @@ import { CfnCondition, CfnParameter, Fn } from 'aws-cdk-lib';
 import { CfnResolver, DynamoDbDataSource } from 'aws-cdk-lib/aws-appsync';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { IConstruct } from 'constructs';
+
 import { DirectiveNode, EnumTypeDefinitionNode, ObjectTypeDefinitionNode, TypeNode } from 'graphql';
 import {
 	ModelResourceIDs,
@@ -23,6 +24,7 @@ import {
 	plurality,
 	toUpper,
 } from 'graphql-transformer-common';
+import { createDBOnS3, createS3Bucket } from './cdk/create_db_bucket';
 import { createEventSourceMapping, createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
 import { DirectiveArgs, GRAPHQL_TYPES_TO_VALID_TYPES, VALID_SCHEMA_TYPES } from './directive-args';
 
@@ -41,6 +43,7 @@ interface SearchableObjectTypeDefinition {
 	fieldName: string;
 	fieldNameRaw: string;
 	directiveArguments: DirectiveArgs;
+	schema: Schema | undefined;
 }
 
 export class OramaSearchableTransformer extends TransformerPluginBase implements TransformerPluginProvider {
@@ -70,14 +73,14 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 			expression: Fn.conditionNot(Fn.conditionEquals(envParam, ResourceConstants.NONE)),
 		});
 
-		stack.templateOptions.description = 'An auto-generated nested stack for orama search.';
-		stack.templateOptions.templateFormatVersion = '2010-09-09';
-
 		// streaming lambda role
 		const lambdaRole = createLambdaRole(context, stack);
 
-		// creates algolia lambda
+		// creates lambda
 		const lambda = createLambda(stack, context.api, lambdaRole, Env);
+
+		// create a bucket for each env that will store the DB file
+		const bucket = createS3Bucket(stack, Env);
 
 		// add lambda as data source for the search queries
 		const lambdaDataSource = context.api.host.addLambdaDataSource(`searchResolverDataSource`, lambda, {}, stack);
@@ -92,6 +95,8 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 			}
 
 			ddbTable.grantStreamRead(lambdaRole);
+			bucket.grantReadWrite(lambdaRole);
+			createDBOnS3(stack, bucket, definition.fieldName, Env);
 
 			// creates event source mapping from ddb to lambda
 			if (!ddbTable.tableStreamArn) {
@@ -108,6 +113,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 			if (!typeName) {
 				throw new Error('Query type name not found');
 			}
+
 			// Connect the resolver to the API
 			const resolver = new CfnResolver(stack, `${definition.fieldNameRaw}SearchResolver`, {
 				apiId: context.api.apiId,
@@ -143,6 +149,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 			fieldName,
 			fieldNameRaw: definition.name.value,
 			directiveArguments,
+			schema: undefined,
 		});
 	}
 
@@ -152,9 +159,6 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 	transformSchema(context: TransformerTransformSchemaStepContextProvider) {
 		// For each model that has been annotated with @oramaSearchable
 		const fields = this.searchableObjectTypeDefinitions.map(({ fieldName, fieldNameRaw }) => {
-			// Add the search query field to the schema
-			// e.g. searchBlogs(query: String): AWSJSON
-
 			const field = {
 				name: fieldName,
 				args: [
@@ -185,6 +189,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 
 		const visitedTypes = new Map<string, Record<string, string> | string[]>();
 
+		let index = 0;
 		for (const { directiveArguments } of this.searchableObjectTypeDefinitions) {
 			const notFoundSchemaTypes = getNonValidSchemaType(directiveArguments);
 
@@ -225,6 +230,8 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 				schema[schemaField] = getSchema(schemaType, visitedTypes);
 			}
 			// schema is ready
+			this.searchableObjectTypeDefinitions[index].schema = schema;
+			index++;
 		}
 	}
 }
