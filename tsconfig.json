@@ -1,12 +1,12 @@
 {
     "extends": "@tsconfig/node18/tsconfig.json",
-    "outDir": "./dist",
     "compilerOptions": {
+        "lib": ["DOM","ES2022"],
         "declaration": true,
         "sourceMap": true,
         "outDir": "./dist",
         "noImplicitAny": true,
         "strict": true
       },
-      "exclude": ["dist", "test/**/*","lib"]
+    "exclude": ["dist", "*/__test__/*","lib", "node_modules/","lambdas"],
 }
