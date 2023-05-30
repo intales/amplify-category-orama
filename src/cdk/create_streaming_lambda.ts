@@ -1,21 +1,20 @@
+import { S3MappingFunctionCode } from '@aws-amplify/graphql-transformer-core/lib/cdk-compat/template-asset';
 import { GraphQLAPIProvider, TransformerContextProvider } from '@aws-amplify/graphql-transformer-interfaces';
 import { Stack } from 'aws-cdk-lib';
 import { Effect, IRole, Policy, PolicyStatement, Role, ServicePrincipal } from 'aws-cdk-lib/aws-iam';
-import { EventSourceMapping, IFunction, ILayerVersion, Runtime, StartingPosition } from 'aws-cdk-lib/aws-lambda';
+import { CfnFunction, EventSourceMapping, IFunction, Runtime, StartingPosition } from 'aws-cdk-lib/aws-lambda';
+import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
 import { resolve } from 'path';
 
-const ID = 'OramaFunctionID';
-const ZIP_PATH = ['build', 'handler.zip'];
-
-export function createLambdaRole(context: TransformerContextProvider, stack: Construct): IRole {
-	const role = new Role(stack, 'OramaLambdaRole', {
+export function createLambdaRole(context: TransformerContextProvider, stack: Construct, prefix: string): IRole {
+	const role = new Role(stack, prefix + 'OramaLambdaRole', {
 		assumedBy: new ServicePrincipal('lambda.amazonaws.com'),
-		roleName: context.resourceHelper.generateIAMRoleName('OramaIAMRole'),
+		roleName: context.resourceHelper.generateIAMRoleName(prefix + 'OramaRole'),
 	});
 
 	role.attachInlinePolicy(
-		new Policy(stack, 'CloudwatchLogsAccess', {
+		new Policy(stack, prefix + 'CloudwatchLogsAccess', {
 			statements: [
 				new PolicyStatement({
 					actions: ['logs:CreateLogGroup', 'logs:CreateLogStream', 'logs:PutLogEvents'],
@@ -29,24 +28,39 @@ export function createLambdaRole(context: TransformerContextProvider, stack: Con
 	return role;
 }
 
-export const createLambda = (
-	stack: Stack,
-	apiGraphql: GraphQLAPIProvider,
-	lambdaRole: IRole,
-	env: string
-): IFunction => {
-	const filePath = resolve(__dirname, '..', '..', ...ZIP_PATH),
-		runtime = Runtime.NODEJS_18_X;
+export const createLambda = (stack: Stack, lambdaRole: IRole, prefix: string, api: GraphQLAPIProvider): IFunction => {
+	// eslint-disable-next-line no-constant-condition
+	if (false) {
+		const filePath = resolve(__dirname, '..', '..', 'lambdas', prefix, 'index.ts');
+		const functionKey = prefix + 'OramaFunction',
+			fn = new NodejsFunction(stack, functionKey, {
+				entry: filePath,
+				handler: 'handler',
+				role: lambdaRole,
+				runtime: Runtime.NODEJS_18_X,
+				depsLockFilePath: resolve(__dirname, '..', '..', 'package-lock.json'),
+			});
 
-	const functionName = 'OramaFunction',
-		functionKey = `functions/${ID}-${env}.zip`,
+		const functionCode = new S3MappingFunctionCode(functionKey, filePath).bind(fn);
+		(fn.node.defaultChild as CfnFunction).code = {
+			s3Key: functionCode.s3ObjectKey,
+			s3Bucket: functionCode.s3BucketName,
+		};
+		return fn;
+	}
+
+	const runtime = Runtime.NODEJS_18_X;
+	const filePath = resolve(__dirname, '..', '..', 'build', prefix + '.zip');
+
+	const functionName = prefix + 'OramaFunction',
+		functionKey = `functions/${functionName}.zip`,
 		handlerName = 'handler',
-		layers: ILayerVersion[] = [],
+		layers = undefined,
 		role = lambdaRole,
 		environment: { [key: string]: string } = {},
 		timeout = undefined;
 
-	return apiGraphql.host.addLambdaFunction(
+	return api.host.addLambdaFunction(
 		functionName,
 		functionKey,
 		handlerName,
