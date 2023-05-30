@@ -1,9 +1,4 @@
-import {
-	DirectiveWrapper,
-	InvalidDirectiveError,
-	TransformerNestedStack,
-	TransformerPluginBase,
-} from '@aws-amplify/graphql-transformer-core';
+import { DirectiveWrapper, InvalidDirectiveError, TransformerPluginBase } from '@aws-amplify/graphql-transformer-core';
 import {
 	StackManagerProvider,
 	TransformerContextProvider,
@@ -29,7 +24,7 @@ import {
 	plurality,
 	toUpper,
 } from 'graphql-transformer-common';
-import { createS3Bucket } from './cdk/create_db_bucket';
+import { createDBOnS3, createS3Bucket } from './cdk/create_db_bucket';
 import { createEventSourceMapping, createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
 import { DirectiveArgs, GRAPHQL_TYPES_TO_VALID_TYPES, VALID_SCHEMA_TYPES } from './directive-args';
 
@@ -101,9 +96,9 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 				throw new Error(`Failed to find ddb table for @${directiveName} on field ${definition.entity}`);
 			}
 
-			// if (definition.schema === undefined)
-			// 	console.warn(`No schema found for @oramaSearchable on entity  ${definition.entity}`);
-			// else createDBOnS3(stack, bucket, definition.fieldName, definition.schema);
+			if (definition.schema === undefined)
+				console.warn(`No schema found for @oramaSearchable on entity  ${definition.entity}`);
+			else createDBOnS3(stack, bucket, definition.fieldName, definition.schema);
 
 			bucket.grantRead(searchLambda.lambdaRole);
 
@@ -165,16 +160,6 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 	 */
 	transformSchema(context: TransformerTransformSchemaStepContextProvider) {
 		// For each model that has been annotated with @oramaSearchable
-
-		const stack = this.getStack(context.stackManager) as TransformerNestedStack;
-		stack.setParameter(
-			ResourceConstants.PARAMETERS.S3DeploymentBucket,
-			Fn.ref(ResourceConstants.PARAMETERS.S3DeploymentBucket)
-		);
-		stack.setParameter(
-			ResourceConstants.PARAMETERS.S3DeploymentRootKey,
-			Fn.ref(ResourceConstants.PARAMETERS.S3DeploymentRootKey)
-		);
 
 		const fields = this.searchableObjectTypeDefinitions.map(({ fieldName, entity }) => {
 			const field = {
