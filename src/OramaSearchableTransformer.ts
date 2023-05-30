@@ -1,16 +1,21 @@
-import { DirectiveWrapper, InvalidDirectiveError, TransformerPluginBase } from '@aws-amplify/graphql-transformer-core';
 import {
+	DirectiveWrapper,
+	InvalidDirectiveError,
+	TransformerNestedStack,
+	TransformerPluginBase,
+} from '@aws-amplify/graphql-transformer-core';
+import {
+	StackManagerProvider,
 	TransformerContextProvider,
 	TransformerPluginProvider,
 	TransformerSchemaVisitStepContextProvider,
 	TransformerTransformSchemaStepContextProvider,
 } from '@aws-amplify/graphql-transformer-interfaces';
 import { Schema, SearchableType } from '@orama/orama';
-import { CfnCondition, CfnParameter, Fn } from 'aws-cdk-lib';
+import { CfnCondition, CfnParameter, Fn, Stack } from 'aws-cdk-lib';
 import { CfnResolver, DynamoDbDataSource } from 'aws-cdk-lib/aws-appsync';
 import { Table } from 'aws-cdk-lib/aws-dynamodb';
 import { IConstruct } from 'constructs';
-
 import { DirectiveNode, EnumTypeDefinitionNode, ObjectTypeDefinitionNode, TypeNode } from 'graphql';
 import {
 	ModelResourceIDs,
@@ -24,30 +29,31 @@ import {
 	plurality,
 	toUpper,
 } from 'graphql-transformer-common';
-import { createDBOnS3, createS3Bucket } from './cdk/create_db_bucket';
+import { createS3Bucket } from './cdk/create_db_bucket';
 import { createEventSourceMapping, createLambda, createLambdaRole } from './cdk/create_streaming_lambda';
 import { DirectiveArgs, GRAPHQL_TYPES_TO_VALID_TYPES, VALID_SCHEMA_TYPES } from './directive-args';
 
 const STACK_NAME = 'OramaStack';
 const directiveName = 'oramaSearchable';
 const RESPONSE_MAPPING_TEMPLATE = `
-#if( $ctx.error )
-  $util.error($ctx.error.message, $ctx.error.type)
+#if( $context.error )
+  $util.error($context.error.message, $context.error.type)
 #else
-  $util.parseJson($ctx.result)
+  $util.toJson($context.result)
 #end
 `;
 
 interface SearchableObjectTypeDefinition {
 	node: ObjectTypeDefinitionNode;
 	fieldName: string;
-	fieldNameRaw: string;
+	entity: string;
 	directiveArguments: DirectiveArgs;
 	schema: Schema | undefined;
 }
 
 export class OramaSearchableTransformer extends TransformerPluginBase implements TransformerPluginProvider {
 	searchableObjectTypeDefinitions: SearchableObjectTypeDefinition[];
+	stasck: Stack | undefined;
 
 	constructor() {
 		super(
@@ -57,6 +63,14 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 		`
 		);
 		this.searchableObjectTypeDefinitions = [];
+		this.stasck = undefined;
+	}
+
+	private getStack(stackManager: StackManagerProvider) {
+		if (!this.stasck) {
+			this.stasck = stackManager.createStack(STACK_NAME);
+		}
+		return this.stasck;
 	}
 
 	/**
@@ -65,25 +79,18 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 	generateResolvers(context: TransformerContextProvider) {
 		const { Env } = ResourceConstants.PARAMETERS;
 		const { HasEnvironmentParameter } = ResourceConstants.CONDITIONS;
-		const stack = context.stackManager.createStack(STACK_NAME);
-
+		const stack = this.getStack(context.stackManager);
 		const envParam = context.stackManager.getParameter(Env) as CfnParameter;
 
 		new CfnCondition(stack, HasEnvironmentParameter, {
 			expression: Fn.conditionNot(Fn.conditionEquals(envParam, ResourceConstants.NONE)),
 		});
 
-		// streaming lambda role
-		const lambdaRole = createLambdaRole(context, stack);
-
-		// creates lambda
-		const lambda = createLambda(stack, context.api, lambdaRole, Env);
-
 		// create a bucket for each env that will store the DB file
-		const bucket = createS3Bucket(stack, Env);
+		const bucket = createS3Bucket(stack);
 
-		// add lambda as data source for the search queries
-		const lambdaDataSource = context.api.host.addLambdaDataSource(`searchResolverDataSource`, lambda, {}, stack);
+		const searchLambda = generateLambda(context, stack, 'search');
+		const triggerLambda = generateLambda(context, stack, 'trigger');
 
 		for (const definition of this.searchableObjectTypeDefinitions) {
 			const typeName = context.output.getQueryTypeName();
@@ -91,12 +98,14 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 			const ddbTable = table as Table;
 
 			if (!ddbTable) {
-				throw new Error(`Failed to find ddb table for @${directiveName} on field ${definition.fieldNameRaw}`);
+				throw new Error(`Failed to find ddb table for @${directiveName} on field ${definition.entity}`);
 			}
 
-			ddbTable.grantStreamRead(lambdaRole);
-			bucket.grantReadWrite(lambdaRole);
-			createDBOnS3(stack, bucket, definition.fieldName, Env);
+			// if (definition.schema === undefined)
+			// 	console.warn(`No schema found for @oramaSearchable on entity  ${definition.entity}`);
+			// else createDBOnS3(stack, bucket, definition.fieldName, definition.schema);
+
+			bucket.grantRead(searchLambda.lambdaRole);
 
 			// creates event source mapping from ddb to lambda
 			if (!ddbTable.tableStreamArn) {
@@ -105,22 +114,25 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 
 			createEventSourceMapping(
 				stack,
-				`eventSourceMapping-${definition.fieldNameRaw}-${Env}`,
-				lambda,
+				`eventSourceMapping-${definition.entity}`,
+				triggerLambda.lambda,
 				ddbTable.tableStreamArn
 			);
+
+			ddbTable.grantStreamRead(triggerLambda.lambdaRole);
+			bucket.grantReadWrite(triggerLambda.lambdaRole);
 
 			if (!typeName) {
 				throw new Error('Query type name not found');
 			}
 
 			// Connect the resolver to the API
-			const resolver = new CfnResolver(stack, `${definition.fieldNameRaw}SearchResolver`, {
+			const resolver = new CfnResolver(stack, `${definition.entity}SearchResolver`, {
 				apiId: context.api.apiId,
 				fieldName: definition.fieldName,
 				typeName: 'Query',
 				// kind: 'UNIT',
-				dataSourceName: lambdaDataSource.ds.attrName,
+				dataSourceName: searchLambda.lambdaDataSource.ds.attrName,
 				requestMappingTemplate: getRequestMappingTemplate(ddbTable.tableName),
 				responseMappingTemplate: RESPONSE_MAPPING_TEMPLATE,
 			});
@@ -134,12 +146,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 	 * This method handles transforming directives on objects type definitions. This includes type
 	 * extensions.
 	 */
-	object(
-		definition: ObjectTypeDefinitionNode,
-		directive: DirectiveNode,
-		// eslint-disable-next-line @typescript-eslint/no-unused-vars
-		acc: TransformerSchemaVisitStepContextProvider
-	) {
+	object(definition: ObjectTypeDefinitionNode, directive: DirectiveNode) {
 		validateModelDirective(definition);
 		const directiveArguments = getDirectiveArguments(directive);
 		validateSchemaFields(directiveArguments.schema, definition);
@@ -147,7 +154,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 		this.searchableObjectTypeDefinitions.push({
 			node: definition,
 			fieldName,
-			fieldNameRaw: definition.name.value,
+			entity: definition.name.value,
 			directiveArguments,
 			schema: undefined,
 		});
@@ -158,7 +165,18 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 	 */
 	transformSchema(context: TransformerTransformSchemaStepContextProvider) {
 		// For each model that has been annotated with @oramaSearchable
-		const fields = this.searchableObjectTypeDefinitions.map(({ fieldName, fieldNameRaw }) => {
+
+		const stack = this.getStack(context.stackManager) as TransformerNestedStack;
+		stack.setParameter(
+			ResourceConstants.PARAMETERS.S3DeploymentBucket,
+			Fn.ref(ResourceConstants.PARAMETERS.S3DeploymentBucket)
+		);
+		stack.setParameter(
+			ResourceConstants.PARAMETERS.S3DeploymentRootKey,
+			Fn.ref(ResourceConstants.PARAMETERS.S3DeploymentRootKey)
+		);
+
+		const fields = this.searchableObjectTypeDefinitions.map(({ fieldName, entity }) => {
 			const field = {
 				name: fieldName,
 				args: [
@@ -167,7 +185,7 @@ export class OramaSearchableTransformer extends TransformerPluginBase implements
 					/* limit */
 					makeInputValueDefinition('limit', makeNamedType('Int')),
 				],
-				type: makeNonNullType(makeListType(makeNamedType(fieldNameRaw))),
+				type: makeNonNullType(makeListType(makeNamedType(entity))),
 			};
 			return makeField(field.name, field.args, field.type);
 		});
@@ -317,11 +335,37 @@ const getTable = (context: TransformerContextProvider, definition: ObjectTypeDef
 };
 
 const getRequestMappingTemplate = (tableName: string) => /* VTL */ `
-$util.toJson({ "version": "2018-05-29", "operation": "Invoke", "payload": $util.toJson({ "typeName": "Query", "tableName": "${tableName}", "arguments": $util.toJson($ctx.args) }) })
+	$util.toJson({	
+		"version": "2018-05-29", 
+		"operation": "Invoke", 
+		"payload": { 
+			"typeName": "Query", 
+			"tableName": "${tableName}", 
+			"arguments": $context.arguments,
+			"selectionSetList": $utils.toJson($context.info.selectionSetList)
+		}
+	})
 `;
-function validateSchemaFields(schema: Record<string, string>, definition: ObjectTypeDefinitionNode) {
+
+const validateSchemaFields = (schema: Record<string, string>, definition: ObjectTypeDefinitionNode) => {
 	Object.keys(schema).forEach((key) => {
 		if (!definition.fields?.map((el) => el.name.value).includes(key))
 			throw new InvalidDirectiveError(`${key} is not a valid field of ${definition.name.value}`);
 	});
-}
+};
+
+const generateLambda = (context: TransformerContextProvider, stack: Stack, type: string) => {
+	// streaming lambda role
+	const lambdaRole = createLambdaRole(context, stack, type);
+
+	// creates lambda
+	const lambda = createLambda(stack, lambdaRole, type, context.api);
+
+	// add lambda as data source for the search queries
+	const lambdaDataSource = context.api.host.addLambdaDataSource(`${type}ResolverDataSource`, lambda, {}, stack);
+	return {
+		lambdaRole,
+		lambda,
+		lambdaDataSource,
+	};
+};
