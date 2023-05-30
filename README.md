@@ -1,1 +1,1 @@
-# amplify-provider-orama
+# amplify-category-orama
